@@ -20,7 +20,7 @@ flowchart TD
 ```
 
 1. FastAPI valida `message` e `user_id` com Pydantic.
-2. O Router pede ao Gemini um JSON com `route`, usando `response_mime_type` e um schema com os três valores permitidos.
+2. O Router pede ao Gemini um JSON com `route`, usando `response_mime_type` e `response_json_schema` com os três valores permitidos. O schema vem de `model_json_schema()` do Pydantic, preservando o formato JSON Schema enviado à API.
 3. O JSON é validado novamente antes do encaminhamento. Uma classificação inválida produz HTTP 502; não existe fallback que escolha uma rota silenciosamente.
 4. O agente selecionado recupera seu contexto, chama Gemini e retorna `answer`, `agents_used`, `tools_used` e `sources`.
 
@@ -220,11 +220,28 @@ Knowledge retorna `agents_used: ["router", "knowledge"]` com `getnet_rag` ou `we
 | 200 | Resposta gerada, inclusive quando o contexto é insuficiente e isso é informado |
 | 404 | Cliente sem dados locais |
 | 422 | Campos ausentes, vazios, extras ou fora dos limites |
-| 502 | Falha do Gemini/busca, resposta vazia ou JSON de decisão inválido |
-| 503 | Chave não configurada ou base local necessária indisponível |
+| 429 | Limite de requisições ou cota do Gemini atingido |
+| 502 | Falha de conexão/busca, chave recusada, modelo inválido, resposta vazia ou JSON de decisão inválido |
+| 503 | Gemini temporariamente indisponível, chave não configurada ou base local necessária indisponível |
 | 504 | Timeout do Gemini |
 
 Erros controlados usam `{"detail":"descrição"}`. Erros de validação usam o formato padrão de detalhes do FastAPI. `/health` confirma que o processo está respondendo; não verifica disponibilidade dos provedores externos.
+
+### Quando Gemini não responde
+
+`/health` responder e os testes passarem não comprovam acesso ao Gemini: a saúde é local e os testes usam mocks. Uma chave carregada corretamente também pode receber erros de capacidade, cota ou modelo.
+
+- **503**: o modelo está temporariamente indisponível, possivelmente por alta demanda. Aguarde antes de repetir ou selecione outro modelo disponível na sua conta em `GEMINI_MODEL`.
+- **429**: consulte os limites e a cota do projeto no Google AI Studio. Repetir todos os cenários imediatamente pode continuar falhando; a solução depende do limite atingido.
+- **502 com mensagem de acesso ou requisição rejeitada**: revise a chave, as permissões do projeto e os parâmetros. **502 com mensagem de modelo**: revise `GEMINI_MODEL`.
+
+Após editar `.env`, recrie o container para carregar as novas variáveis:
+
+```bash
+docker compose up --build -d --force-recreate
+```
+
+A API devolve mensagens controladas por categoria, sem expor a chave ou o payload bruto do provedor. Não há troca automática de modelo ou retry adicional. Referência: [erros da Gemini API](https://ai.google.dev/gemini-api/docs/api-errors).
 
 ## Testes e critérios de aceitação
 
@@ -239,7 +256,7 @@ No container:
 docker compose exec api python -m pytest -q
 ```
 
-Os testes não precisam de chave nem consomem Gemini. Gemini e DuckDuckGo são substituídos por mocks; a ingestão usa `httpx.MockTransport` e o RAG usa pequenos documentos temporários. Há bloqueio padrão de instâncias reais do SDK e de DDGS nos testes.
+Os testes não precisam de chave nem consomem Gemini. Gemini e DuckDuckGo são substituídos por mocks; a ingestão usa `httpx.MockTransport` e o RAG usa pequenos documentos temporários. Há bloqueio padrão de instâncias reais do SDK e de DDGS nos testes. Um teste específico também executa a serialização real do SDK com transporte HTTP simulado para verificar o JSON Schema enviado ao Google, sem acessar a rede.
 
 A suíte verifica decisões válidas e inválidas, composição dos agentes, contexto enviado ao modelo, perfil/atividade, cliente inexistente, extração/chunking, ranking TF-IDF, limites de crawling, falhas parciais/totais, preservação da base anterior, schemas HTTP, timeouts e falhas de serviços.
 

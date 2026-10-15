@@ -97,7 +97,7 @@ def test_request_validation(client, gemini, payload):
     gemini.generate.assert_not_called()
 
 
-@pytest.mark.parametrize("status", [502, 503, 504])
+@pytest.mark.parametrize("status", [429, 502, 503, 504])
 def test_dependency_errors_have_consistent_json(client, gemini, status):
     gemini.generate.side_effect = AppError(status, "Serviço indisponível")
     response = client.post("/chat", json={"message": "Hello", "user_id": "x"})
