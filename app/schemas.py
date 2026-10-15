@@ -4,6 +4,11 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl, StringConstraints
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 Route = Literal["knowledge_getnet", "knowledge_web", "customer_support"]
+GuardrailCategory = Literal["supported", "irrelevant", "sensitive", "unsafe"]
+EscalationReason = Literal[
+    "unsafe_request", "sensitive_request", "irrelevant_request", "unsupported_request",
+    "insufficient_information", "routing_failure", "internal_error",
+]
 
 
 class ChatRequest(BaseModel):
@@ -17,6 +22,17 @@ class ChatResponse(BaseModel):
     agents_used: list[str]
     tools_used: list[str]
     sources: list[str] = Field(default_factory=list)
+    request_id: str | None = None
+    route: Route | None = None
+    guardrail_category: GuardrailCategory | None = None
+    status: Literal["answered", "escalated"] = "answered"
+    escalation_reason: EscalationReason | None = None
+
+
+class GuardrailResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    category: GuardrailCategory
+    reason: NonEmptyText = Field(max_length=500)
 
 
 class RouteDecision(BaseModel):

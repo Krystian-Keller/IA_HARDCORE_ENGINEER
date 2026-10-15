@@ -1,287 +1,197 @@
-# AI Hardcore Engineer - Multi-Agent Support System
+# AI Hardcore Engineer — Multi-Agent Support System
 
-API síncrona de suporte com Python 3.12, FastAPI e **exatamente três agentes**, conectados por chamadas diretas de funções. Gemini é o único LLM. Documentos e clientes ficam em JSON local; o retrieval usa TF-IDF e similaridade de cosseno.
+API de suporte em Python 3.12 com FastAPI, Gemini, RAG local e dados fictícios de clientes. Quatro agentes se comunicam por funções Python, sem filas ou bancos externos.
 
-## Arquitetura e fluxo
+## 1. Configurar
 
-```mermaid
-flowchart TD
-    C[Client] --> F[FastAPI: POST /chat]
-    F --> R[Router Agent]
-    R --> K[Knowledge Agent]
-    R --> S[Customer Support Agent]
-    K --> G[Getnet RAG local]
-    K --> W[Web Search: DuckDuckGo]
-    S --> T[Customer Tools: JSON local]
-    G --> L[Gemini]
-    W --> L
-    T --> L
-    L --> J[JSON Response]
-```
-
-1. FastAPI valida `message` e `user_id` com Pydantic.
-2. O Router pede ao Gemini um JSON com `route`, usando `response_mime_type` e `response_json_schema` com os três valores permitidos. O schema vem de `model_json_schema()` do Pydantic, preservando o formato JSON Schema enviado à API.
-3. O JSON é validado novamente antes do encaminhamento. Uma classificação inválida produz HTTP 502; não existe fallback que escolha uma rota silenciosamente.
-4. O agente selecionado recupera seu contexto, chama Gemini e retorna `answer`, `agents_used`, `tools_used` e `sources`.
-
-| Rota | Responsabilidade | Agente / tool |
-| --- | --- | --- |
-| `knowledge_getnet` | Produtos, Pix, crediário, antecipação, Link de Pagamento, máquinas e regras públicas | Knowledge / `getnet_rag` |
-| `knowledge_web` | Clima, cotações, notícias e informações externas gerais | Knowledge / `web_search` |
-| `customer_support` | Vendas e depósitos do cliente, sua configuração, máquina com falha e erros operacionais | Customer Support / customer tools |
-
-O prompt diferencia dúvidas gerais de problemas concretos: requisitos bancários para receber por Pix são conhecimento público; o depósito das vendas de ontem exige dados do cliente. A mensagem do usuário é serializada como dado, e o modelo recebe instruções para não obedecer a comandos embutidos na mensagem ou nos documentos.
-
-### Knowledge: Getnet RAG
-
-A ingestão é explícita e independente da inicialização da API:
-
-```text
-URLs Getnet → httpx → HTML → BeautifulSoup → texto → chunks com source
-           → data/rag/chunks.json → TF-IDF → cosine similarity → top-4 → Gemini
-```
-
-- Fontes iniciais: `https://www.getnet.net/` e `https://www.getnet.net/en`.
-- Crawling sequencial de até **6 URLs tentadas** por padrão, configurável de 2 a 10. Links descobertos ficam no mesmo domínio, em HTTPS, sem query string ou fragmento. Redirecionamentos para outro domínio não são incorporados à base.
-- BeautifulSoup remove scripts, estilos e elementos de navegação e prioriza o conteúdo de `main` ou `article`.
-- Chunks de 180 palavras, com sobreposição de 30, preservam `text` e `source`. URLs iniciais que redirecionam para a mesma página não duplicam seus chunks.
-- O JSON é salvo por substituição atômica. Falhas parciais são relatadas; se todas as páginas falharem, a base anterior é preservada e o comando termina com código 1.
-- `TfidfVectorizer`, com unigramas, bigramas e normalização de acentos, cria a matriz local. A consulta usa similaridade de cosseno e devolve até quatro chunks com pontuação maior que zero.
-- A matriz é reconstruída do pequeno JSON em cada consulta. Não há banco vetorial, embeddings ou arquivos pickle.
-- O prompt exige resposta no idioma da pergunta, somente com suporte no contexto, preservando URLs e admitindo falta de informações. Ausência de termos relevantes gera contexto vazio; não são introduzidos documentos fictícios na base pública.
-
-Depois da ingestão, **extração e retrieval funcionam sem acesso às páginas Getnet**. A geração ainda precisa acessar Gemini. Uma base ausente, vazia ou inválida produz HTTP 503 somente nas consultas Getnet; `/health`, busca web e suporte continuam independentes da base RAG.
-
-### Knowledge: busca web
-
-`web_search(query)` usa `DDGS.text` com `backend="duckduckgo"`, sem chave de busca, e retorna até cinco resultados validados com `title`, `snippet` e `url`. Títulos/snippets e URLs são enviados ao Gemini. Não são baixadas as páginas dos resultados. O prompt proíbe completar lacunas com informações inventadas e pede atenção às datas de notícias, clima e cotações. Uma busca sem resultados pode gerar uma resposta explicando a insuficiência de informações; falhas do provedor geram HTTP 502.
-
-`sources` lista as URLs do contexto fornecido à geração, sem duplicatas. Sua presença não garante que todos os detalhes solicitados estejam disponíveis nos trechos.
-
-### Customer Support e tools
-
-Um segundo JSON estruturado do Gemini escolhe uma ou ambas as tools permitidas. A seleção é validada e executada por uma lista explícita de funções; o modelo não escolhe outro `user_id` nem executa funções arbitrárias.
-
-- `get_customer_profile(user_id)`: cadastro e configuração de recebimento.
-- `get_customer_activity(user_id)`: vendas, depósitos previstos, máquina, conectividade e último erro de transação.
-
-`data/customers.json` contém `cliente1988`, com registros **inteiramente fictícios** e um snapshot fixo em **15/10/2026**. Há uma venda de débito e uma de crédito em 14/10, com previsões distintas. O agente recebe datas explícitas, deve identificar a demonstração e não pode prometer uma transferência real. Em outra data, “ontem” não atualiza esses registros automaticamente. Cliente inexistente gera HTTP 404 com informação clara; base local inválida gera HTTP 503.
-
-## Estrutura
-
-```text
-app/
-  main.py                  # FastAPI, composição e tratamento de erros
-  config.py                # .env e variáveis de ambiente
-  schemas.py               # requests, respostas, decisões e erros controlados
-  agents/
-    router.py
-    knowledge.py
-    customer_support.py
-  services/gemini.py        # único ponto de acesso ao LLM
-  rag/
-    ingest.py              # CLI de coleta, extração e chunking
-    retriever.py           # TF-IDF e cosine similarity
-  tools/
-    web_search.py
-    customer_data.py
-data/
-  customers.json
-  rag/                     # chunks.json gerado e ignorado pelo Git
-tests/
-  conftest.py
-  test_router.py
-  test_rag.py
-  test_customer_tools.py
-  test_api.py
-  test_services.py
-.env.example
-requirements.txt
-Dockerfile
-docker-compose.yml
-```
-
-## Configuração do Gemini
+Na raiz do projeto, crie o `.env` se ainda não existir:
 
 ```bash
-cp .env.example .env
+cp -n .env.example .env
 ```
 
-Edite `.env` e preencha sua chave. O arquivo é ignorado pelo Git e pelo contexto do Docker. Variáveis já exportadas prevalecem sobre o `.env` na execução local.
+Preencha a chave e o modelo no `.env`:
 
 ```dotenv
 GEMINI_API_KEY=sua-chave
-GEMINI_MODEL=gemini-flash-latest
+GEMINI_MODEL=gemini-3.5-flash-lite
 GEMINI_TIMEOUT_SECONDS=30
 HTTP_TIMEOUT_SECONDS=15
 ```
 
-O nome do modelo é configurável; use um modelo Gemini disponível na sua conta. Para operar sem custos, utilize uma conta/modelo com cota gratuita e sem cobrança habilitada. A aplicação não contrata recursos ou serviços adicionais. Limites e disponibilidade da API dependem da conta Google.
+O `.env` é ignorado pelo Git. Use um modelo disponível na sua conta e uma cota gratuita para executar sem custos.
 
-Todas as chamadas usam `google-genai` em `app/services/gemini.py`, com timeout em milissegundos no SDK e uma tentativa por chamada. Não há mecanismo próprio de retry. O cliente é fechado após cada geração. Sem chave, `/health` funciona e `/chat` retorna 503. Não há chamadas ao Gemini durante a inicialização ou ingestão.
+## 2. Executar com Docker
 
-Referências das interfaces: [Google Gen AI SDK](https://googleapis.github.io/python-genai/) e [DDGS](https://pypi.org/project/ddgs/).
-
-## Execução local
-
-Requer Python **3.12** e acesso à internet para instalar dependências, coletar documentos e acessar Gemini/busca web.
-
-```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-# Preencha GEMINI_API_KEY em .env.
-python -m app.rag.ingest
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-
-Para tentar apenas as duas páginas iniciais:
-
-```bash
-python -m app.rag.ingest --max-pages 2
-```
-
-O resultado da ingestão informa `pages_loaded`, `chunks` e `failures`. Reexecute o comando para atualizar a base. A API lê a base atualizada na consulta seguinte. O diretório pode ser alterado com `DATA_DIR`, contendo tanto `customers.json` quanto `rag/chunks.json`.
-
-## Execução com Docker
-
-Requer Docker e Docker Compose com suporte a `env_file.required` (Compose 2.24 ou superior).
-
-```bash
-cp .env.example .env
-# Preencha GEMINI_API_KEY em .env.
-docker compose up --build
-```
-
-API: `http://localhost:8000`. Documentação interativa: `http://localhost:8000/docs`.
-
-Em outro terminal, carregue a base Getnet antes da primeira consulta RAG:
-
-```bash
-docker compose exec api python -m app.rag.ingest
-```
-
-Existe somente um serviço/container. `./data` é montado em `/app/data`, preservando os documentos após recriação do container. A API inicia mesmo sem `.env` ou sem corpus para permitir verificar `/health`; consultas dependentes de configuração ausente retornam erro explícito.
-
-```bash
-docker compose down
-```
-
-## API e exemplos
-
-```bash
-curl -s http://localhost:8000/health
-```
-
-```json
-{"status":"ok"}
-```
-
-Getnet RAG:
-
-```bash
-curl -s http://localhost:8000/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"message":"How does receivables advance (antecipação) work with Getnet?","user_id":"cliente1988"}'
-```
-
-Busca web:
-
-```bash
-curl -s http://localhost:8000/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"message":"What is the weather forecast in Porto Alegre tomorrow?","user_id":"cliente1988"}'
-```
-
-Atendimento:
-
-```bash
-curl -s http://localhost:8000/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"message":"When will the money from yesterday’s sales be deposited?","user_id":"cliente1988"}'
-```
-
-Formato de resposta de atendimento (texto ilustrativo, a redação depende do modelo):
-
-```json
-{
-  "answer": "In these fictional records, the debit sale from October 14 is scheduled for October 15, 2026; the credit sale is scheduled for November 13, 2026.",
-  "agents_used": ["router", "customer_support"],
-  "tools_used": ["get_customer_activity"],
-  "sources": []
-}
-```
-
-Knowledge retorna `agents_used: ["router", "knowledge"]` com `getnet_rag` ou `web_search` em `tools_used`, além das URLs recuperadas em `sources`.
-
-| HTTP | Situação |
-| --- | --- |
-| 200 | Resposta gerada, inclusive quando o contexto é insuficiente e isso é informado |
-| 404 | Cliente sem dados locais |
-| 422 | Campos ausentes, vazios, extras ou fora dos limites |
-| 429 | Limite de requisições ou cota do Gemini atingido |
-| 502 | Falha de conexão/busca, chave recusada, modelo inválido, resposta vazia ou JSON de decisão inválido |
-| 503 | Gemini temporariamente indisponível, chave não configurada ou base local necessária indisponível |
-| 504 | Timeout do Gemini |
-
-Erros controlados usam `{"detail":"descrição"}`. Erros de validação usam o formato padrão de detalhes do FastAPI. `/health` confirma que o processo está respondendo; não verifica disponibilidade dos provedores externos.
-
-### Quando Gemini não responde
-
-`/health` responder e os testes passarem não comprovam acesso ao Gemini: a saúde é local e os testes usam mocks. Uma chave carregada corretamente também pode receber erros de capacidade, cota ou modelo.
-
-- **503**: o modelo está temporariamente indisponível, possivelmente por alta demanda. Aguarde antes de repetir ou selecione outro modelo disponível na sua conta em `GEMINI_MODEL`.
-- **429**: consulte os limites e a cota do projeto no Google AI Studio. Repetir todos os cenários imediatamente pode continuar falhando; a solução depende do limite atingido.
-- **502 com mensagem de acesso ou requisição rejeitada**: revise a chave, as permissões do projeto e os parâmetros. **502 com mensagem de modelo**: revise `GEMINI_MODEL`.
-
-Após editar `.env`, recrie o container para carregar as novas variáveis:
+Requer Docker e Compose 2.24 ou superior.
 
 ```bash
 docker compose up --build -d --force-recreate
+docker compose exec api python -m app.rag.ingest
+curl -fsS http://localhost:8000/health
 ```
 
-A API devolve mensagens controladas por categoria, sem expor a chave ou o payload bruto do provedor. Não há troca automática de modelo ou retry adicional. Referência: [erros da Gemini API](https://ai.google.dev/gemini-api/docs/api-errors).
+Esperado: `{"status":"ok"}`. A ingestão prepara o RAG e pode ser repetida para atualizar os documentos. Após alterar o `.env`, repita o primeiro comando.
 
-## Testes e critérios de aceitação
+- API: http://localhost:8000
+- Documentação interativa: http://localhost:8000/docs
 
-```bash
-source .venv/bin/activate
-python -m pytest -q
-```
-
-No container:
+## 3. Testes automatizados — sem consumir Gemini
 
 ```bash
 docker compose exec api python -m pytest -q
 ```
 
-Os testes não precisam de chave nem consomem Gemini. Gemini e DuckDuckGo são substituídos por mocks; a ingestão usa `httpx.MockTransport` e o RAG usa pequenos documentos temporários. Há bloqueio padrão de instâncias reais do SDK e de DDGS nos testes. Um teste específico também executa a serialização real do SDK com transporte HTTP simulado para verificar o JSON Schema enviado ao Google, sem acessar a rede.
+Usam mocks para Gemini, busca web e downloads. Cobrem roteamento, guardrails, escalonamento, RAG, customer tools, API, logs e avaliação.
 
-A suíte verifica decisões válidas e inválidas, composição dos agentes, contexto enviado ao modelo, perfil/atividade, cliente inexistente, extração/chunking, ranking TF-IDF, limites de crawling, falhas parciais/totais, preservação da base anterior, schemas HTTP, timeouts e falhas de serviços.
+## 4. Avaliação — aprovação/falha
 
-Os dez casos do enunciado exercitam `/chat` com os agentes reais e decisões do Gemini simuladas:
+Com a API rodando e o RAG carregado:
 
-| Caso | Pergunta | Rota esperada |
-| --- | --- | --- |
-| 1 | Get Clássica versus Get Smart | `knowledge_getnet` |
-| 2 | Previsão do tempo em Porto Alegre amanhã | `knowledge_web` |
-| 3 | Depósito das vendas de ontem | `customer_support` |
-| 4 | Necessidade de conta bancária para receber via Pix | `knowledge_getnet` |
-| 5 | Minha máquina não conecta à internet | `customer_support` |
-| 6 | Como funciona antecipação Getnet | `knowledge_getnet` |
-| 7 | Cotação do euro hoje | `knowledge_web` |
-| 8 | Minha máquina mostra erro de transação recusada | `customer_support` |
-| 9 | Parcelas no crediário | `knowledge_getnet` |
-| 10 | Vender por WhatsApp com Link de Pagamento | `knowledge_getnet` |
+```bash
+docker compose exec api python -m evals.run
+```
 
-Esses testes validam o encaminhamento e o tratamento das decisões; não medem a precisão de classificação do modelo real. As perguntas também constam no prompt do Router. A qualidade factual e a classificação com o Gemini escolhido precisam ser avaliadas com uma chave configurada e fontes atuais.
+Executa os **15 casos de [evals/cases.json](evals/cases.json)**: os dez cenários originais, perfil do cliente e quatro bloqueios de guardrail. Mostra `PASSED`/`FAILED`, diferenças entre esperado e recebido e o resumo `Total`, `Passed`, `Failed` e `Accuracy`.
+
+Compara rota, guardrail, tools, escalonamento e validade do `request_id`. **Não avalia a qualidade factual nem imprime o texto completo das respostas.** Código de saída: `0` para aprovação total, `1` para casos com falha e `2` para arquivo de casos inválido.
+
+Usa Gemini real e busca externa, consumindo a cota. A pausa padrão de 15 segundos entre casos reduz erros 429; a execução leva alguns minutos. Para aumentar a pausa:
+
+```bash
+docker compose exec api python -m evals.run --delay 20
+```
+
+## 5. Teste manual — respostas completas
+
+Para uma pergunta, use `/docs` ou `curl`:
+
+```bash
+curl -sS http://localhost:8000/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"When will my recent sales be deposited?","user_id":"cliente1988"}'
+```
+
+Para imprimir o JSON completo dos **mesmos 15 cenários**, incluindo `answer`, `sources` e metadados, execute este bloco. Ele também usa Gemini real e aguarda 15 segundos entre casos:
+
+```bash
+docker compose exec -T api python - <<'PY'
+import json
+import time
+from pathlib import Path
+
+import httpx
+
+casos = json.loads(Path("evals/cases.json").read_text(encoding="utf-8"))
+
+with httpx.Client(timeout=150) as client:
+    for numero, caso in enumerate(casos, start=1):
+        if numero > 1:
+            time.sleep(15)
+        print(f"\n{'=' * 60}", flush=True)
+        print(f"Caso {numero}: {caso['name']}", flush=True)
+        print(f"Rota esperada: {caso['expected_route']}", flush=True)
+        print(caso["message"], flush=True)
+        try:
+            resposta = client.post(
+                "http://localhost:8000/chat",
+                json={"message": caso["message"], "user_id": caso["user_id"]},
+            )
+            print(f"HTTP {resposta.status_code}", flush=True)
+            print(json.dumps(resposta.json(), ensure_ascii=False, indent=2), flush=True)
+        except (httpx.HTTPError, ValueError) as erro:
+            print(f"Falha: {erro}", flush=True)
+PY
+```
+
+O modo manual serve para ler as respostas; ele não calcula aprovação ou métricas.
+
+## Como interpretar a resposta
+
+| Campo | Significado |
+| --- | --- |
+| `answer` | Resposta gerada ou mensagem fixa de escalonamento |
+| `status` | `answered` ou `escalated` |
+| `route` / `guardrail_category` | Decisões tomadas, quando disponíveis |
+| `agents_used` / `tools_used` | Agentes executados e tools tentadas |
+| `sources` | URLs fornecidas como contexto, sem garantia de cobertura completa |
+| `request_id` | UUID para localizar a requisição nos logs; também no header `X-Request-ID` |
+| `escalation_reason` | Motivo padronizado, presente somente no escalonamento |
+
+HTTP `200` indica processamento concluído; confira `status` para identificar escalonamento. Cliente inexistente retorna `404`, entrada inválida retorna `422` e falha inesperada retorna `500`.
+
+**O escalonamento é simulado:** nenhum operador é contatado e nenhum ticket é criado. `answered` indica que houve uma resposta gerada, não que todos os detalhes solicitados foram encontrados.
+
+## Arquitetura
+
+```mermaid
+flowchart TD
+    C[Client] --> F[FastAPI]
+    F --> G[Guardrail]
+    G -->|supported| R[Router Agent]
+    G -->|bloqueio ou erro| H[Human Escalation Agent]
+    R --> K[Knowledge Agent]
+    R --> S[Customer Support Agent]
+    R -->|falha de rota| H
+    K --> A[Getnet RAG]
+    K --> B[DuckDuckGo]
+    K -->|sem contexto ou erro| H
+    S --> T[Customer Tools]
+    S -->|sem dados ou erro| H
+```
+
+- **Guardrail:** Gemini classifica `supported`, `irrelevant`, `sensitive` ou `unsafe` antes do Router. Categorias bloqueadas e decisões inválidas não chegam às tools.
+- **Router:** valida JSON do Gemini e escolhe `knowledge_getnet`, `knowledge_web` ou `customer_support`.
+- **Knowledge:** usa RAG para Getnet ou até cinco snippets DuckDuckGo para perguntas externas. Sem resultados, escalona; com contexto, pede ao Gemini uma resposta fundamentada.
+- **Customer Support:** seleciona `get_customer_profile` e/ou `get_customer_activity`. Consulta `data/customers.json`; `cliente1988` possui dados fictícios com snapshot fixo em 15/10/2026.
+- **Human Escalation:** responde deterministicamente a bloqueios, falta de contexto e falhas, sem chamar Gemini.
+
+Pipeline RAG: **HTML → BeautifulSoup → chunks de 180 palavras, sobreposição de 30 → TF-IDF → cosine similarity → top-4 → Gemini**. Parte de `https://www.getnet.net/` e `https://www.getnet.net/en`, tenta até seis páginas e salva texto e fontes em `data/rag/chunks.json`. O retrieval funciona localmente; a geração depende de Gemini. Falha total na ingestão preserva a base anterior.
+
+O código fica em `app/agents`, `app/guardrails`, `app/rag` e `app/tools`. Toda chamada ao LLM passa por `app/services/gemini.py`. Não há banco vetorial, embeddings pagos ou framework de agentes.
+
+## Logs e diagnóstico
+
+```bash
+docker compose logs -f api
+```
+
+Eventos JSON registram recebimento, guardrail, rota, tools, retrieval, escalonamento e conclusão, correlacionados por `request_id`. Usam apenas `logging`, sem serviço externo, e não incluem chave, mensagem ou dados privados do cliente. Os logs do Uvicorn mantêm o formato padrão.
+
+Falhas externas viram escalonamento controlado. Consulte o código e a etapa no evento `request_failed`:
+
+| Código no log | O que verificar |
+| --- | --- |
+| `429` | Cota/limite no Google AI Studio; aumente `--delay` ou a pausa manual se for limite de frequência |
+| `503` | Chave ausente, modelo indisponível ou base local inválida; confira a etapa |
+| `502` | Chave, permissões, modelo, parâmetros ou conectividade |
+| `504` | Timeout do Gemini |
+
+`/health` confirma somente que a API responde. Os testes com mocks também não comprovam disponibilidade do Gemini.
+
+## Executar sem Docker
+
+Com Python 3.12 e o `.env` configurado:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python -m app.rag.ingest
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+Em outro terminal, com o ambiente ativado, use `python -m pytest -q` ou `python -m evals.run`. O teste manual pode ser feito em `/docs` ou com o `curl` acima.
 
 ## Limitações
 
-- Projeto de demonstração local, sem autenticação ou integração com contas reais. Os dados e condições financeiras dos clientes são fictícios e não representam ofertas Getnet.
-- A coleta é limitada a HTML público e não executa JavaScript. Bloqueios, mudanças no site ou cobertura insuficiente podem impedir respostas sobre produtos específicos. O agente deve informar essa insuficiência.
-- TF-IDF mede coincidência de termos; não oferece compreensão semântica nem tradução entre idiomas. As duas fontes iniciais ajudam na cobertura, mas perguntas sem vocabulário compartilhado podem não encontrar contexto.
-- Snippets de busca podem estar incompletos ou desatualizados e não são uma fonte garantida de previsões ou cotações em tempo real. DuckDuckGo pode limitar ou bloquear solicitações.
-- Os prompts restringem invenções, mas não oferecem garantia matemática contra alucinações ou injeção de instruções. As fontes retornadas permitem revisão.
-- Fluxo síncrono, voltado a pequeno volume: duas chamadas Gemini para conhecimento, três para suporte. Não há histórico de conversas, agendamento ou atualização automática do corpus.
+- RAG limitado a páginas HTML públicas e coincidência de termos; pode faltar documentação específica. Snippets web podem estar desatualizados.
+- Classificação e redação dependem do Gemini; aprovação na avaliação não garante precisão factual ou consistência de idioma.
+- Dados de clientes são fictícios e não se atualizam automaticamente. O guardrail não substitui autenticação; esta demonstração não possui autenticação.
+- Fluxo síncrono: até três chamadas Gemini para conhecimento e quatro para suporte. Quotas e indisponibilidade externas podem afetar os testes reais.
+
+Para encerrar o Docker:
+
+```bash
+docker compose down
+```

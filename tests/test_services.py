@@ -7,7 +7,7 @@ import pytest
 from google.genai import Client as GenaiClient, errors
 
 from app.config import Settings
-from app.schemas import AppError, RouteDecision, ToolDecision
+from app.schemas import AppError, GuardrailResult, RouteDecision, ToolDecision
 from app.services.gemini import Gemini
 from app.tools.web_search import web_search
 
@@ -38,6 +38,7 @@ def test_gemini_uses_env_configuration_and_structured_json(monkeypatch):
 
 
 @pytest.mark.parametrize("schema,answer", [
+    (GuardrailResult, '{"category":"supported","reason":"normal request"}'),
     (RouteDecision, '{"route":"knowledge_web"}'),
     (ToolDecision, '{"tools":["get_customer_activity"]}'),
     (None, "A grounded answer."),

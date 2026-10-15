@@ -12,6 +12,8 @@ from app.config import Settings
 from app.main import app, get_router
 from app.services.gemini import Gemini
 
+SUPPORTED = '{"category":"supported","reason":"normal supported request"}'
+
 
 @pytest.fixture(autouse=True)
 def block_live_services(monkeypatch):

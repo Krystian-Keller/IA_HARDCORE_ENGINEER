@@ -1,9 +1,10 @@
 import json
+from uuid import UUID
 
 import pytest
 
 from app.schemas import AppError, SearchResult
-from tests.conftest import ACCEPTANCE_CASES
+from tests.conftest import ACCEPTANCE_CASES, SUPPORTED
 
 
 @pytest.mark.parametrize("message,route", ACCEPTANCE_CASES)
@@ -18,7 +19,7 @@ def test_acceptance_cases_through_real_agents(client, settings, gemini, monkeypa
     monkeypatch.setattr("app.agents.knowledge.web_search", lambda *args, **kwargs: [
         SearchResult(title="Test result", snippet="Test context", url="https://example.com/test")
     ])
-    responses = [json.dumps({"route": route})]
+    responses = [SUPPORTED, json.dumps({"route": route})]
     if route == "customer_support":
         responses.append('{"tools":["get_customer_activity"]}')
     responses.append("Resposta de teste baseada no contexto.")
@@ -26,6 +27,11 @@ def test_acceptance_cases_through_real_agents(client, settings, gemini, monkeypa
     response = client.post("/chat", json={"message": message, "user_id": "cliente1988"})
     assert response.status_code == 200
     body = response.json()
+    assert UUID(body["request_id"])
+    assert response.headers["X-Request-ID"] == body["request_id"]
+    assert body["route"] == route
+    assert body["guardrail_category"] == "supported"
+    assert body["status"] == "answered"
     assert body["answer"] == "Resposta de teste baseada no contexto."
     expected_agent = "customer_support" if route == "customer_support" else "knowledge"
     assert body["agents_used"] == ["router", expected_agent]
@@ -44,7 +50,7 @@ def test_acceptance_cases_through_real_agents(client, settings, gemini, monkeypa
 
 
 def test_profile_tool_is_selected(client, gemini):
-    gemini.generate.side_effect = ['{"route":"customer_support"}',
+    gemini.generate.side_effect = [SUPPORTED, '{"route":"customer_support"}',
                                    '{"tools":["get_customer_profile"]}', "Dados fictícios do perfil."]
     response = client.post("/chat", json={"message": "Qual minha configuração de recebimento?",
                                          "user_id": "cliente1988"})
@@ -54,38 +60,47 @@ def test_profile_tool_is_selected(client, gemini):
 
 
 def test_unknown_customer_is_explicit(client, gemini):
-    gemini.generate.side_effect = ['{"route":"customer_support"}',
+    gemini.generate.side_effect = [SUPPORTED, '{"route":"customer_support"}',
                                    '{"tools":["get_customer_activity"]}']
     response = client.post("/chat", json={"message": "Minhas vendas", "user_id": "unknown"})
     assert response.status_code == 404
     assert "Não há dados" in response.json()["detail"]
-    assert gemini.generate.call_count == 2
+    assert UUID(response.json()["request_id"])
+    assert gemini.generate.call_count == 3
 
 
 def test_missing_rag_does_not_break_health_or_web(client, gemini, monkeypatch):
-    gemini.generate.return_value = '{"route":"knowledge_getnet"}'
+    gemini.generate.side_effect = [SUPPORTED, '{"route":"knowledge_getnet"}']
     response = client.post("/chat", json={"message": "Getnet?", "user_id": "cliente1988"})
-    assert response.status_code == 503
-    assert "ingest" in response.json()["detail"]
+    assert response.status_code == 200
+    assert response.json()["escalation_reason"] == "internal_error"
     assert client.get("/health").json() == {"status": "ok"}
     monkeypatch.setattr("app.agents.knowledge.web_search", lambda *args, **kwargs: [])
-    gemini.generate.side_effect = ['{"route":"knowledge_web"}', "Não há informações suficientes."]
+    gemini.generate.reset_mock()
+    gemini.generate.side_effect = [SUPPORTED, '{"route":"knowledge_web"}']
     response = client.post("/chat", json={"message": "Clima?", "user_id": "cliente1988"})
     assert response.status_code == 200
     assert response.json()["sources"] == []
-    assert "CONTEXT: []" in gemini.generate.call_args.args[0]
+    assert response.json()["escalation_reason"] == "insufficient_information"
+    assert gemini.generate.call_count == 2
 
 
 @pytest.mark.parametrize("decision", ['{"route":"invalid"}', 'not json'])
-def test_invalid_router_returns_502(client, gemini, decision):
-    gemini.generate.return_value = decision
-    assert client.post("/chat", json={"message": "Hello", "user_id": "x"}).status_code == 502
+def test_invalid_router_escalates(client, gemini, decision):
+    gemini.generate.side_effect = [SUPPORTED, decision]
+    response = client.post("/chat", json={"message": "Hello", "user_id": "x"})
+    assert response.status_code == 200
+    assert response.json()["escalation_reason"] == "routing_failure"
+    assert response.json()["agents_used"] == ["router", "human_escalation"]
 
 
 @pytest.mark.parametrize("selection", ['{"tools":[]}', '{"tools":["arbitrary_tool"]}', "not json"])
 def test_invalid_tool_selection_is_controlled(client, gemini, selection):
-    gemini.generate.side_effect = ['{"route":"customer_support"}', selection]
-    assert client.post("/chat", json={"message": "My sales", "user_id": "x"}).status_code == 502
+    gemini.generate.side_effect = [SUPPORTED, '{"route":"customer_support"}', selection]
+    response = client.post("/chat", json={"message": "My sales", "user_id": "x"})
+    assert response.status_code == 200
+    assert response.json()["escalation_reason"] == "unsupported_request"
+    assert response.json()["tools_used"] == []
 
 
 @pytest.mark.parametrize("payload", [
@@ -93,13 +108,18 @@ def test_invalid_tool_selection_is_controlled(client, gemini, selection):
     {"message": "Hello", "user_id": ""}, {"message": "a" * 5001, "user_id": "x"},
 ])
 def test_request_validation(client, gemini, payload):
-    assert client.post("/chat", json=payload).status_code == 422
+    response = client.post("/chat", json=payload)
+    assert response.status_code == 422
+    assert UUID(response.json()["request_id"])
     gemini.generate.assert_not_called()
 
 
 @pytest.mark.parametrize("status", [429, 502, 503, 504])
-def test_dependency_errors_have_consistent_json(client, gemini, status):
+def test_guardrail_dependency_failure_escalates(client, gemini, status):
     gemini.generate.side_effect = AppError(status, "Serviço indisponível")
     response = client.post("/chat", json={"message": "Hello", "user_id": "x"})
-    assert response.status_code == status
-    assert response.json() == {"detail": "Serviço indisponível"}
+    assert response.status_code == 200
+    assert response.json()["status"] == "escalated"
+    assert response.json()["escalation_reason"] == "internal_error"
+    assert response.json()["agents_used"] == ["human_escalation"]
+    assert UUID(response.json()["request_id"])

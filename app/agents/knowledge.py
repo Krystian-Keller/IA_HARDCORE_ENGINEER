@@ -2,9 +2,11 @@ import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from app.agents.human_escalation import HumanEscalationAgent
 from app.config import Settings
+from app.logging_config import log_event
 from app.rag.retriever import Retriever
-from app.schemas import ChatResponse, Route
+from app.schemas import AppError, ChatResponse, Route
 from app.services.gemini import Gemini
 from app.tools.web_search import web_search
 
@@ -15,19 +17,32 @@ class KnowledgeAgent:
         self.settings = settings
 
     def answer(self, message: str, route: Route) -> ChatResponse:
-        if route == "knowledge_getnet":
-            # Rebuild from local JSON; no HTTP fetch or executable pickle on this path.
-            chunks = Retriever.from_file(
-                self.settings.data_dir / "rag" / "chunks.json"
-            ).retrieve(message)
-            context = [chunk.model_dump(mode="json") for chunk in chunks]
-            sources = list(dict.fromkeys(str(chunk.source) for chunk in chunks))
-            tools = ["getnet_rag"]
-        else:
-            results = web_search(message, timeout=self.settings.http_timeout_seconds)
-            context = [result.model_dump(mode="json") for result in results]
-            sources = list(dict.fromkeys(str(result.url) for result in results))
-            tools = ["web_search"]
+        tools = ["getnet_rag" if route == "knowledge_getnet" else "web_search"]
+        log_event("tool_called", tool=tools[0])
+        try:
+            if route == "knowledge_getnet":
+                # Rebuild from local JSON; no HTTP fetch or executable pickle on this path.
+                chunks = Retriever.from_file(
+                    self.settings.data_dir / "rag" / "chunks.json"
+                ).retrieve(message)
+                context = [chunk.model_dump(mode="json") for chunk in chunks]
+                sources = list(dict.fromkeys(str(chunk.source) for chunk in chunks))
+                log_event("rag_retrieval", results_count=len(chunks))
+            else:
+                results = web_search(message, timeout=self.settings.http_timeout_seconds)
+                context = [result.model_dump(mode="json") for result in results]
+                sources = list(dict.fromkeys(str(result.url) for result in results))
+                log_event("web_search", results_count=len(results))
+        except AppError as exc:
+            log_event("request_failed", stage="retrieval", status_code=exc.status_code)
+            return HumanEscalationAgent.handle(
+                message, "internal_error", agents_used=["router", "knowledge"], tools_used=tools
+            )
+        if not context:
+            return HumanEscalationAgent.handle(
+                message, "insufficient_information", agents_used=["router", "knowledge"],
+                tools_used=tools,
+            )
         prompt = (
             "You are the Knowledge Agent. Respond in the same language as the user's question. "
             "Use ONLY facts supported by the supplied context. Do not invent products, rules, "
@@ -41,5 +56,13 @@ class KnowledgeAgent:
             f"QUESTION: {json.dumps(message, ensure_ascii=False)}\n"
             f"CONTEXT: {json.dumps(context, ensure_ascii=False)}"
         )
-        return ChatResponse(answer=self.gemini.generate(prompt), agents_used=["router", "knowledge"],
+        try:
+            answer = self.gemini.generate(prompt)
+        except AppError as exc:
+            log_event("request_failed", stage="generation", status_code=exc.status_code)
+            return HumanEscalationAgent.handle(
+                message, "internal_error", agents_used=["router", "knowledge"],
+                tools_used=tools, sources=sources,
+            )
+        return ChatResponse(answer=answer, agents_used=["router", "knowledge"],
                             tools_used=tools, sources=sources)

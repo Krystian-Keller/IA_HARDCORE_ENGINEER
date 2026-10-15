@@ -3,7 +3,10 @@ import json
 from pydantic import ValidationError
 
 from app.agents.customer_support import CustomerSupportAgent
+from app.agents.human_escalation import HumanEscalationAgent
 from app.agents.knowledge import KnowledgeAgent
+from app.guardrails.guardrail import check_guardrail
+from app.logging_config import log_event
 from app.schemas import AppError, ChatRequest, ChatResponse, Route, RouteDecision
 from app.services.gemini import Gemini
 
@@ -52,7 +55,48 @@ class RouterAgent:
             raise AppError(502, "O Gemini retornou uma classificação inválida.") from exc
 
     def chat(self, request: ChatRequest) -> ChatResponse:
-        route = self.classify(request.message)
-        if route == "customer_support":
-            return self.support.answer(request.message, request.user_id)
-        return self.knowledge.answer(request.message, route)
+        try:
+            guardrail = check_guardrail(request.message, self.gemini, user_id=request.user_id)
+        except Exception as exc:
+            log_event("request_failed", stage="guardrail", error_type=type(exc).__name__,
+                      status_code=getattr(exc, "status_code", None))
+            return HumanEscalationAgent.handle(request.message, "internal_error")
+        if guardrail.category != "supported":
+            reason = {"sensitive": "sensitive_request", "unsafe": "unsafe_request",
+                      "irrelevant": "irrelevant_request"}[guardrail.category]
+            result = HumanEscalationAgent.handle(request.message, reason)
+            result.guardrail_category = guardrail.category
+            return result
+        try:
+            route = self.classify(request.message)
+        except Exception as exc:
+            log_event("request_failed", stage="routing", error_type=type(exc).__name__,
+                      status_code=getattr(exc, "status_code", None))
+            result = HumanEscalationAgent.handle(
+                request.message, "routing_failure", agents_used=["router"]
+            )
+            result.guardrail_category = guardrail.category
+            return result
+        log_event("route_selected", route=route)
+        try:
+            if route == "customer_support":
+                result = self.support.answer(request.message, request.user_id)
+            else:
+                result = self.knowledge.answer(request.message, route)
+        except AppError as exc:
+            if exc.status_code == 404:
+                raise  # Keep the existing explicit unknown-customer response.
+            log_event("request_failed", stage="agent", status_code=exc.status_code)
+            result = HumanEscalationAgent.handle(
+                request.message, "internal_error",
+                agents_used=["router", "customer_support" if route == "customer_support" else "knowledge"],
+            )
+        except Exception as exc:
+            log_event("request_failed", stage="agent", error_type=type(exc).__name__)
+            result = HumanEscalationAgent.handle(
+                request.message, "internal_error",
+                agents_used=["router", "customer_support" if route == "customer_support" else "knowledge"],
+            )
+        result.guardrail_category = guardrail.category
+        result.route = route
+        return result
