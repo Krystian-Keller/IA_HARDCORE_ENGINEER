@@ -1,7 +1,10 @@
-"""Run explicitly: python -m app.rag.ingest [--max-pages 6]."""
+"""Run explicitly: python -m app.rag.ingest [--max-pages 12]."""
 
 import argparse
+import base64
+import binascii
 import json
+import re
 from pathlib import Path
 from urllib.parse import urldefrag, urljoin, urlparse
 
@@ -11,43 +14,98 @@ import httpx
 from app.config import Settings
 from app.schemas import AppError, Chunk
 
-SEED_URLS = ["https://www.getnet.net/", "https://www.getnet.net/en"]
+SEED_URLS = [
+    "https://site.getnet.com.br/maquininha/get-classica/",
+    "https://site.getnet.com.br/maquininha/get-smart/",
+    "https://site.getnet.com.br/pix/",
+    "https://site.getnet.com.br/crediario/",
+    "https://site.getnet.com.br/link-de-pagamento/",
+    "https://site.getnet.com.br/duvidas/",
+    "https://site.getnet.com.br/get-ajuda-get-conta/o-que-e-a-get-conta/",
+    "https://site.getnet.com.br/quando-vale-a-pena-antecipar-as-suas-vendas-no-cartao/",
+    "https://site.getnet.com.br/",
+    "https://www.getnet.net/",
+    "https://www.getnet.net/en",
+]
+ALLOWED_HOSTS = {"site.getnet.com.br", "www.getnet.net", "getnet.net"}
+
+# Read only literal display data embedded by Getnet's FAQ/technical-sheet widgets.
+# This does not execute JavaScript or download scripts.
+JS_STRING = r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`'''
+JS_TOKENS = re.compile(rf"(?P<string>{JS_STRING})|(?P<comment>//[^\n]*|/\*.*?\*/)", re.DOTALL)
+DISPLAY_FIELD = re.compile(rf"\b(?:title|content)\s*:\s*(?P<value>{JS_STRING})(?=\s*[,}}])", re.DOTALL)
+
+
+def embedded_display_text(soup: BeautifulSoup) -> list[str]:
+    texts = []
+    for script in soup.find_all("script"):
+        code = script.get_text()
+        src = script.get("src", "")
+        if src.startswith("data:text/javascript;base64,"):
+            try:
+                code = base64.b64decode(src.split(",", 1)[1], validate=True).decode("utf-8")
+            except (ValueError, binascii.Error, UnicodeError):
+                continue
+        if not any(marker in code for marker in ("faq-content", "FichaTecnicaAtributos(")):
+            continue
+        section = "Ficha técnica: " if "FichaTecnicaAtributos(" in code else "Perguntas frequentes: "
+        code = JS_TOKENS.sub(lambda match: match.group("string") or "", code)
+        values = []
+        for match in DISPLAY_FIELD.finditer(code):
+            value = match.group("value")[1:-1]
+            if "${" in value:
+                continue  # Computed template values are not static source facts.
+            value = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m[1], 16)), value)
+            value = re.sub(r"\\([\\'\"`/])", r"\1", value)
+            value = re.sub(r"\\[nrt]", " ", value)
+            text = BeautifulSoup(value, "html.parser").get_text(" ", strip=True)
+            if text:
+                values.append(text)
+        if values:
+            texts.append(section + " ".join(values))
+    return texts
 
 
 def chunk_text(text: str, size: int = 180, overlap: int = 30) -> list[str]:
     """Chunks are measured in words, with a small overlap."""
     if not 0 <= overlap < size:
         raise ValueError("Require 0 <= overlap < size")
-    words = text.split()
     chunks = []
-    for start in range(0, len(words), size - overlap):
-        chunks.append(" ".join(words[start : start + size]))
-        if start + size >= len(words):
-            break
+    # Keep technical sheets and FAQ widgets separate from promotional page copy.
+    for section in re.split(r"\n\s*\n", text):
+        words = section.split()
+        for start in range(0, len(words), size - overlap):
+            chunks.append(" ".join(words[start : start + size]))
+            if start + size >= len(words):
+                break
     return chunks
 
 
 def is_getnet_url(url: str) -> bool:
     parsed = urlparse(url)
-    return parsed.scheme == "https" and parsed.netloc in {"www.getnet.net", "getnet.net"}
+    return parsed.scheme == "https" and parsed.netloc in ALLOWED_HOSTS
 
 
 def extract_page(html: str, source: str) -> tuple[str, list[str]]:
     soup = BeautifulSoup(html, "html.parser")
+    embedded = embedded_display_text(soup) if urlparse(source).hostname == "site.getnet.com.br" else []
     links = []
     for anchor in soup.select("a[href]"):
         url = urldefrag(urljoin(source, anchor["href"]))[0]
-        if is_getnet_url(url) and not urlparse(url).query:
+        if (is_getnet_url(url) and not urlparse(url).query
+                and not urlparse(url).path.startswith(("/wp-", "/api/"))):
             links.append(url)
-    for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
+    for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "form", "button", "input", "select", "svg"]):
         tag.decompose()
-    content = soup.find("main") or soup.find("article") or soup
-    return " ".join(content.stripped_strings), list(dict.fromkeys(links))
+    content = soup.find("main") or soup.find("article") or soup.body or soup
+    text = " ".join(content.stripped_strings)
+    # Append the widget's literal question/answer text, including HTML-hidden FAQs.
+    return "\n\n".join(part for part in [text, *embedded] if part), list(dict.fromkeys(links))
 
 
-def ingest(output: Path, *, max_pages: int = 6, timeout: float = 15) -> dict:
-    if not 2 <= max_pages <= 10:
-        raise ValueError("max_pages deve estar entre 2 e 10.")
+def ingest(output: Path, *, max_pages: int = 12, timeout: float = 15) -> dict:
+    if not 2 <= max_pages <= 20:
+        raise ValueError("max_pages deve estar entre 2 e 20.")
     pending = list(SEED_URLS)
     visited = set()
     chunks = []
@@ -95,8 +153,8 @@ def ingest(output: Path, *, max_pages: int = 6, timeout: float = 15) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Carrega até 10 páginas públicas Getnet para RAG local.")
-    parser.add_argument("--max-pages", type=int, default=6, choices=range(2, 11))
+    parser = argparse.ArgumentParser(description="Carrega até 20 páginas públicas Getnet para RAG local.")
+    parser.add_argument("--max-pages", type=int, default=12, choices=range(2, 21))
     args = parser.parse_args()
     settings = Settings.from_env()
     try:

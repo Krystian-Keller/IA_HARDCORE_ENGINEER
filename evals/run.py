@@ -1,4 +1,4 @@
-"""Evaluate a running local API. Real classifiers are used; text quality is not scored."""
+"""Evaluate API flow and required source coverage; factual text quality is not scored."""
 
 import argparse
 import json
@@ -20,6 +20,7 @@ class EvaluationCase(ChatRequest):
     expected_status: str = "answered"
     expected_escalation_reason: EscalationReason | None = None
     expected_tools: list[str]
+    expected_sources: list[str] = Field(default_factory=list)
 
 
 def evaluate_case(case: EvaluationCase, client: httpx.Client, base_url: str) -> dict:
@@ -29,6 +30,7 @@ def evaluate_case(case: EvaluationCase, client: httpx.Client, base_url: str) -> 
         "escalation_reason": case.expected_escalation_reason,
         "tools_used": sorted(case.expected_tools), "valid_request_id": True,
         "human_escalation": case.expected_status == "escalated",
+        "required_sources_present": True,
     }
     try:
         response = client.post(base_url.rstrip("/") + "/chat", json={
@@ -49,6 +51,7 @@ def evaluate_case(case: EvaluationCase, client: httpx.Client, base_url: str) -> 
             "tools_used": sorted(body.get("tools_used", [])),
             "valid_request_id": valid_request_id,
             "human_escalation": "human_escalation" in body.get("agents_used", []),
+            "required_sources_present": set(case.expected_sources).issubset(body.get("sources", [])),
         }
     except (httpx.HTTPError, ValueError, TypeError) as exc:
         # Do not print request bodies, credentials, answers or exception URLs.

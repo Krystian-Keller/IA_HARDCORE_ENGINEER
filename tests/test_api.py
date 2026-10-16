@@ -22,7 +22,10 @@ def test_acceptance_cases_through_real_agents(client, settings, gemini, monkeypa
     responses = [SUPPORTED, json.dumps({"route": route})]
     if route == "customer_support":
         responses.append('{"tools":["get_customer_activity"]}')
-    responses.append("Resposta de teste baseada no contexto.")
+        responses.append("Resposta de teste baseada no contexto.")
+    else:
+        responses.append(json.dumps({"sufficient_context": True,
+                                     "answer": "Resposta de teste baseada no contexto."}))
     gemini.generate.side_effect = responses
     response = client.post("/chat", json={"message": message, "user_id": "cliente1988"})
     assert response.status_code == 200
@@ -123,3 +126,24 @@ def test_guardrail_dependency_failure_escalates(client, gemini, status):
     assert response.json()["escalation_reason"] == "internal_error"
     assert response.json()["agents_used"] == ["human_escalation"]
     assert UUID(response.json()["request_id"])
+
+
+@pytest.mark.parametrize("generated,reason", [
+    ('{"sufficient_context":false,"answer":"There is not enough information."}', "insufficient_information"),
+    ("There is not enough information.", "internal_error"),
+    ('{"sufficient_context":true,"answer":" "}', "internal_error"),
+])
+def test_nonempty_retrieval_does_not_make_abstention_an_answer(client, gemini, settings, generated, reason):
+    corpus = settings.data_dir / "rag/chunks.json"
+    corpus.parent.mkdir()
+    source = "https://site.getnet.com.br/pix/"
+    corpus.write_text(json.dumps([{"text": "Pix payments are available.", "source": source}]))
+    gemini.generate.side_effect = [SUPPORTED, '{"route":"knowledge_getnet"}', generated]
+    response = client.post("/chat", json={"message": "Do I need a bank account for Pix?", "user_id": "x"})
+    body = response.json()
+    assert response.status_code == 200
+    assert body["status"] == "escalated"
+    assert body["escalation_reason"] == reason
+    assert body["sources"] == [source]
+    assert body["agents_used"] == ["router", "knowledge", "human_escalation"]
+    assert body["tools_used"] == ["getnet_rag"]

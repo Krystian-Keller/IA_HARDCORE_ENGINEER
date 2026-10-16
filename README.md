@@ -31,7 +31,7 @@ docker compose exec api python -m app.rag.ingest
 curl -fsS http://localhost:8000/health
 ```
 
-Esperado: `{"status":"ok"}`. A ingestão prepara o RAG e pode ser repetida para atualizar os documentos. Após alterar o `.env`, repita o primeiro comando.
+Esperado: `{"status":"ok"}`. A ingestão prepara o RAG com páginas oficiais brasileiras, incluindo Clássica, Smart e Pix. Repita a ingestão para atualizar os documentos; após alterar código ou `.env`, repita também o primeiro comando.
 
 - API: http://localhost:8000
 - Documentação interativa: http://localhost:8000/docs
@@ -54,7 +54,7 @@ docker compose exec api python -m evals.run
 
 Executa os **15 casos de [evals/cases.json](evals/cases.json)**: os dez cenários originais, perfil do cliente e quatro bloqueios de guardrail. Mostra `PASSED`/`FAILED`, diferenças entre esperado e recebido e o resumo `Total`, `Passed`, `Failed` e `Accuracy`.
 
-Compara rota, guardrail, tools, escalonamento e validade do `request_id`. **Não avalia a qualidade factual nem imprime o texto completo das respostas.** Código de saída: `0` para aprovação total, `1` para casos com falha e `2` para arquivo de casos inválido.
+Compara rota, guardrail, tools, escalonamento e validade do `request_id`. A comparação de máquinas exige as fontes dos dois produtos; o caso Pix exige a página brasileira de Pix. **Não avalia a precisão factual do texto nem imprime as respostas completas.** Código de saída: `0` para aprovação total, `1` para casos com falha e `2` para arquivo de casos inválido.
 
 Usa Gemini real e busca externa, consumindo a cota. A pausa padrão de 15 segundos entre casos reduz erros 429; a execução leva alguns minutos. Para aumentar a pausa:
 
@@ -120,7 +120,7 @@ O modo manual serve para ler as respostas; ele não calcula aprovação ou métr
 
 HTTP `200` indica processamento concluído; confira `status` para identificar escalonamento. Cliente inexistente retorna `404`, entrada inválida retorna `422` e falha inesperada retorna `500`.
 
-**O escalonamento é simulado:** nenhum operador é contatado e nenhum ticket é criado. `answered` indica que houve uma resposta gerada, não que todos os detalhes solicitados foram encontrados.
+**O escalonamento é simulado:** nenhum operador é contatado e nenhum ticket é criado. No Knowledge, o Gemini deve declarar que o contexto permite responder; caso contrário, retorna `escalated` com `insufficient_information`. Essa declaração não substitui a revisão factual.
 
 ## Arquitetura
 
@@ -142,11 +142,13 @@ flowchart TD
 
 - **Guardrail:** Gemini classifica `supported`, `irrelevant`, `sensitive` ou `unsafe` antes do Router. Categorias bloqueadas e decisões inválidas não chegam às tools.
 - **Router:** valida JSON do Gemini e escolhe `knowledge_getnet`, `knowledge_web` ou `customer_support`.
-- **Knowledge:** usa RAG para Getnet ou até cinco snippets DuckDuckGo para perguntas externas. Sem resultados, escalona; com contexto, pede ao Gemini uma resposta fundamentada.
+- **Knowledge:** usa RAG para Getnet ou até cinco snippets DuckDuckGo para perguntas externas. Escalona se não houver resultados ou se o modelo declarar contexto insuficiente.
 - **Customer Support:** seleciona `get_customer_profile` e/ou `get_customer_activity`. Consulta `data/customers.json`; `cliente1988` possui dados fictícios com snapshot fixo em 15/10/2026.
 - **Human Escalation:** responde deterministicamente a bloqueios, falta de contexto e falhas, sem chamar Gemini.
 
-Pipeline RAG: **HTML → BeautifulSoup → chunks de 180 palavras, sobreposição de 30 → TF-IDF → cosine similarity → top-4 → Gemini**. Parte de `https://www.getnet.net/` e `https://www.getnet.net/en`, tenta até seis páginas e salva texto e fontes em `data/rag/chunks.json`. O retrieval funciona localmente; a geração depende de Gemini. Falha total na ingestão preserva a base anterior.
+Pipeline RAG: **HTML → BeautifulSoup → chunks de até 180 palavras, sobreposição de 30 → TF-IDF → cosine similarity → até 4 trechos → Gemini**. Prioriza `site.getnet.com.br`: máquinas, Pix, crediário, Link de Pagamento, Get Conta e antecipação. Mantém as páginas globais `getnet.net` como fontes adicionais. Tenta até 12 URLs (máximo configurável de 20) e salva em `data/rag/chunks.json`.
+
+Extrai também os textos literais das fichas técnicas e FAQs embutidas nos widgets, sem executar JavaScript, e mantém essas seções separadas das ofertas. Expande termos comuns de inglês para português; comparações preservam fontes dos dois produtos. O retrieval é local; a geração depende do Gemini. Falha total na ingestão preserva a base anterior.
 
 O código fica em `app/agents`, `app/guardrails`, `app/rag` e `app/tools`. Toda chamada ao LLM passa por `app/services/gemini.py`. Não há banco vetorial, embeddings pagos ou framework de agentes.
 
@@ -185,7 +187,7 @@ Em outro terminal, com o ambiente ativado, use `python -m pytest -q` ou `python 
 
 ## Limitações
 
-- RAG limitado a páginas HTML públicas e coincidência de termos; pode faltar documentação específica. Snippets web podem estar desatualizados.
+- RAG limitado às páginas coletadas e coincidência de termos, com expansão bilíngue simples; pode faltar documentação específica. Não renderiza JavaScript. Snippets web podem estar desatualizados.
 - Classificação e redação dependem do Gemini; aprovação na avaliação não garante precisão factual ou consistência de idioma.
 - Dados de clientes são fictícios e não se atualizam automaticamente. O guardrail não substitui autenticação; esta demonstração não possui autenticação.
 - Fluxo síncrono: até três chamadas Gemini para conhecimento e quatro para suporte. Quotas e indisponibilidade externas podem afetar os testes reais.

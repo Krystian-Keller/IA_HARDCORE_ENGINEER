@@ -4,7 +4,11 @@
     "message": "What's the difference between the Get Clássica and the Get Smart?",
     "user_id": "cliente1988",
     "expected_route": "knowledge_getnet",
-    "expected_tools": ["getnet_rag"]
+    "expected_tools": ["getnet_rag"],
+    "expected_sources": [
+      "https://site.getnet.com.br/maquininha/get-classica/",
+      "https://site.getnet.com.br/maquininha/get-smart/"
+    ]
   },
   {
     "name": "weather_porto_alegre",
@@ -25,7 +29,8 @@
     "message": "Do I need a bank account to receive my sales via Pix?",
     "user_id": "cliente1988",
     "expected_route": "knowledge_getnet",
-    "expected_tools": ["getnet_rag"]
+    "expected_tools": ["getnet_rag"],
+    "expected_sources": ["https://site.getnet.com.br/pix/"]
   },
   {
     "name": "customer_connectivity",

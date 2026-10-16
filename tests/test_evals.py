@@ -78,3 +78,23 @@ def test_malformed_api_output_fails_evaluation(body):
                           expected_route="knowledge_web", expected_tools=[])
     with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=body))) as client:
         assert evaluate_case(case, client, "http://test")["passed"] is False
+
+
+@pytest.mark.parametrize("sources,passed", [
+    (["https://www.getnet.net/en/"], False),
+    (["https://site.getnet.com.br/maquininha/get-classica/"], False),
+    (["https://site.getnet.com.br/maquininha/get-classica/",
+      "https://site.getnet.com.br/maquininha/get-smart/"], True),
+])
+def test_comparison_evaluation_requires_both_product_sources(sources, passed):
+    case = EvaluationCase(
+        name="machines", message="Compare Get Clássica and Get Smart", user_id="x",
+        expected_route="knowledge_getnet", expected_tools=["getnet_rag"],
+        expected_sources=["https://site.getnet.com.br/maquininha/get-classica/",
+                          "https://site.getnet.com.br/maquininha/get-smart/"],
+    )
+    body = {"request_id": str(uuid4()), "route": "knowledge_getnet", "guardrail_category": "supported",
+            "status": "answered", "agents_used": ["router", "knowledge"],
+            "tools_used": ["getnet_rag"], "sources": sources}
+    with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=body))) as client:
+        assert evaluate_case(case, client, "http://test")["passed"] is passed

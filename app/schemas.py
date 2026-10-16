@@ -35,6 +35,15 @@ class GuardrailResult(BaseModel):
     reason: NonEmptyText = Field(max_length=500)
 
 
+class KnowledgeAnswer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    sufficient_context: bool
+    answer: NonEmptyText = Field(description=(
+        "Directly answer the user's question in the same language as the question, "
+        "translating source facts when needed. Use only supplied evidence."
+    ))
+
+
 class RouteDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
     route: Route
